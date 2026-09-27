@@ -13,6 +13,9 @@ class AppConfig(object):
         self.vehicle_id = values.get("vehicle_id", "0")
         self.sensor_id = values.get("sensor_id", "perfectPerception1")
         self.loop_hz = max(1.0, float(values.get("loop_hz", "20")))
+        self.sensor_timeout_ms = max(1, int(values.get("sensor_timeout_ms", "500")))
+        self.max_sensor_frame_gap = max(0, int(values.get("max_sensor_frame_gap", "10")))
+        self.pipeline_timeout_ms = max(1, int(values.get("pipeline_timeout_ms", "200")))
         self.map_timeout_sec = max(1.0, float(values.get("map_timeout_sec", "100")))
         self.connect_timeout_sec = max(1.0, float(values.get("connect_timeout_sec", "30")))
         self.scene_id_override = int(values.get("scene_id_override", "0"))
@@ -40,4 +43,3 @@ def load_config(project_dir, custom_path=None):
     if not parser.has_section("app"):
         raise RuntimeError("配置缺少 [app] 段")
     return AppConfig(project_dir, dict(parser.items("app")))
-

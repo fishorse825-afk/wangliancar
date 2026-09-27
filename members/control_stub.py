@@ -8,8 +8,10 @@ from core.interfaces import ControlOut
 
 
 def compute_control(perception, trajectory):
-    output = ControlOut()
+    output = ControlOut().bind(trajectory)
     output.source = "captain_placeholder_no_actuation"
     output.valid = False
+    output.errors.append("CONTROL_NOT_IMPLEMENTED")
+    if trajectory.emergency_stop:
+        output.errors.append("EMERGENCY_STOP_UNACTUATED")
     return output
-

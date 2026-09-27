@@ -1,8 +1,10 @@
 """Convert raw official API data into the captain's stable team interface."""
 
 import math
+import copy
+import time
 
-from core.geometry import calculate_ttc, speed_2d, world_to_ego
+from core.geometry import calculate_ttc, speed_2d, world_to_ego, project_polyline
 from core.interfaces import EgoState, Perception, Target, TrafficControl
 from simone_platform.case_resolver import resolve_scene_id
 
@@ -20,17 +22,31 @@ _TRAFFIC_LIGHT_STATUS = {
 }
 
 
+def _finite_data(value):
+    if isinstance(value, (int, float)):
+        return math.isfinite(value)
+    if isinstance(value, dict):
+        return all(_finite_data(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return all(_finite_data(item) for item in value)
+    return True
+
+
 class PerceptionBuilder(object):
     def __init__(self, adapter, route_manager, scene_override=0):
         self.adapter = adapter
         self.route_manager = route_manager
         self.scene_override = scene_override
         self.case_name = ""
+        self.case_id = ""
+        self.task_id = ""
         self.scene_id = int(scene_override)
 
     def update_case_info(self):
         info = self.adapter.get_case_info()
         self.case_name = info.get("case_name", "")
+        self.case_id = info.get("case_id", "")
+        self.task_id = info.get("task_id", "")
         self.scene_id = resolve_scene_id(self.case_name, self.scene_override)
         return info
 
@@ -39,69 +55,268 @@ class PerceptionBuilder(object):
 
     def build_from_raw(self, raw):
         result = Perception()
-        result.case_name = self.case_name
-        result.scene_id = self.scene_id
-        gps = raw.get("gps") if raw else None
-        if not gps:
-            result.errors.append("GPS_UNAVAILABLE")
+        result.case_name, result.case_id = self.case_name, self.case_id
+        result.task_id, result.scene_id = self.task_id, self.scene_id
+        config = getattr(self.adapter, "config", None)
+        timeout = getattr(config, "sensor_timeout_ms", 500)
+        max_gap = getattr(config, "max_sensor_frame_gap", 10)
+        ttl = getattr(config, "pipeline_timeout_ms", 200)
+        result.valid_until = time.monotonic() + ttl / 1000.0
+        if not isinstance(raw, dict):
+            result.errors.append("SNAPSHOT_UNAVAILABLE")
             return result
-        result.ego = self._build_ego(gps)
-        result.frame_id = result.ego.frame_id
-        result.timestamp = result.ego.timestamp
+        raw = copy.deepcopy(raw)
+        if not isinstance(raw.get("source_status", {}), dict):
+            result.errors.append("SOURCE_STATUS_INVALID")
+            raw["source_status"] = {}
+        for name in ("errors", "reference_errors"):
+            value = raw.get(name, [])
+            if isinstance(value, list):
+                result.errors.extend(str(item) for item in value)
+            else:
+                result.errors.append(name.upper() + "_INVALID")
+        sensor_errors = raw.get("sensor_errors", [])
+        result.sensor_errors = list(sensor_errors) if isinstance(sensor_errors, list) else ["SENSOR_ERRORS_INVALID"]
+        result.source_status = raw.get("source_status", {})
+        gps = raw.get("gps")
+        result.ego = self._build_ego(gps, timeout)
+        result.frame_id, result.timestamp = result.ego.frame_id, result.ego.timestamp
+        result.source_status.setdefault("gps", {
+            "read_ok": isinstance(gps, dict), "frame_id": result.frame_id,
+            "timestamp": result.timestamp,
+            "age_ms": result.ego.age_ms})
+        if not isinstance(result.source_status["gps"], dict):
+            result.source_status["gps"] = {"read_ok": False, "data_invalid": True}
         if not result.ego.valid:
-            result.errors.append("GPS_LOST")
-            return result
-        result.lane = self.route_manager.update(result.ego)
+            result.source_status["gps"]["data_invalid"] = True
+        if not result.ego.valid:
+            result.errors.append("GPS_UNAVAILABLE" if not gps else "GPS_INVALID_OR_STALE")
+        # Keep auxiliary observations available even when GPS is unavailable.
+        for name, empty in (("route_points", []), ("route_waypoints", []),
+                            ("traffic_signs", []),
+                            ("sensor_configurations", []), ("environment", {}), ("imu", {})):
+            value = raw.get(name, copy.deepcopy(empty))
+            flag = "route_valid" if name.startswith("route_") else name + "_valid"
+            ok = isinstance(value, type(empty)) and _finite_data(value)
+            setattr(result, name, value if ok else empty)
+            setattr(result, flag, bool(raw.get(flag, False)) and ok)
+            if not ok:
+                result.errors.append(name.upper() + "_INVALID")
+        # route_points and route_waypoints share one status; a bad one invalidates both.
+        result.route_valid = bool(raw.get("route_valid", False)) and all(
+            _finite_data(raw.get(n, [])) and isinstance(raw.get(n, []), list)
+            for n in ("route_points", "route_waypoints"))
+        result.sensor_configurations_valid = bool(raw.get("sensor_configurations_valid", False)) and bool(
+            isinstance(raw.get("sensor_configurations", []), list) and
+            _finite_data(raw.get("sensor_configurations", [])))
+        result.environment_valid = bool(raw.get("environment_valid", False)) and isinstance(
+            raw.get("environment", {}), dict) and _finite_data(raw.get("environment", {}))
+        result.imu_valid = bool(raw.get("imu_valid", False)) and isinstance(
+            raw.get("imu", {}), dict) and _finite_data(raw.get("imu", {}))
+        for data_name, status_name, prefix in (
+                ("radar_detections", "radar_status", "radar:"),
+                ("sensor_lane_observations", "sensor_lane_status", "lane:"),
+                ("ultrasonic_detections", None, "ultrasonic:")):
+            data = raw.get(data_name, [])
+            if not isinstance(data, list):
+                result.sensor_errors.append(data_name.upper() + "_INVALID")
+                data = []
+            statuses = dict(raw.get(status_name, {})) if status_name and isinstance(raw.get(status_name, {}), dict) else {}
+            clean = []
+            for item in data:
+                if isinstance(item, dict) and _finite_data(item):
+                    clean.append(item)
+                else:
+                    sensor = item.get("sensor_id", "") if isinstance(item, dict) else ""
+                    statuses[sensor] = False
+                    result.sensor_errors.append(data_name.upper() + "_INVALID")
+                    result.source_status.setdefault(prefix + sensor, {})["data_invalid"] = True
+            setattr(result, data_name, clean)
+            if status_name:
+                setattr(result, status_name, statuses)
+            else:
+                result.ultrasonic_valid = bool(raw.get("ultrasonic_valid", False)) and len(clean) == len(data)
+        result.target_source = raw.get("target_source", "none")
+        result.targets_valid = bool(raw.get("targets_valid", False))
+        try:
+            result.targets_frame_id = int(raw.get("targets_frame", -1))
+            result.targets_timestamp = int(raw.get("targets_timestamp", 0))
+            result.targets_age_ms = int(raw.get("targets_age_ms", -1))
+        except (ValueError, TypeError, OverflowError):
+            result.targets_valid = False
+        target_meta = result.source_status.setdefault("targets", {
+            "read_ok": result.targets_valid, "frame_id": result.targets_frame_id,
+            "timestamp": result.targets_timestamp, "age_ms": result.targets_age_ms})
+        if not isinstance(target_meta, dict):
+            result.source_status["targets"] = target_meta = {"read_ok": False,
+                                                                "data_invalid": True}
+        if result.ego.valid:
+            try:
+                result.lane = self.route_manager.update(result.ego)
+            except Exception as exc:
+                result.errors.append("LANE_UNAVAILABLE:" + type(exc).__name__)
         if not result.lane.valid:
             result.errors.append("LANE_UNAVAILABLE")
         lane_half_width = max(1.4, result.lane.lane_width * 0.5)
-        for item in raw.get("targets", []):
-            target = self._build_target(item, result.ego, lane_half_width)
-            if target.valid:
-                result.targets.append(target)
+        target_data = raw.get("targets", [])
+        if not isinstance(target_data, list):
+            target_data = []
+            result.targets_valid = False
+            target_meta["data_invalid"] = True
+        if result.ego.valid:
+            for item in target_data:
+                try:
+                    target = self._build_target(item, result.ego, lane_half_width)
+                    target.source = result.target_source
+                    if target.valid:
+                        if hasattr(self.route_manager, "locate_target"):
+                            target.lane_id, target.same_lane_valid = self.route_manager.locate_target(target)
+                            target.same_lane = target.same_lane_valid and target.lane_id == result.lane.lane_id
+                            target.lane_source = "hdmap" if target.same_lane_valid else "unknown"
+                        result.targets.append(target)
+                    elif not (math.isfinite(target.probability) and 0 <= target.probability < 0.05
+                              and _finite_data(item)):
+                        raise ValueError("invalid target")
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    result.errors.append("TARGET_INVALID")
+                    result.targets_valid = False
+                    target_meta["data_invalid"] = True
+        else:
+            result.targets_valid = False
         result.targets.sort(key=lambda item: item.distance)
-        result.traffic = self._build_traffic(result.ego)
-        result.valid = True
+        for source, meta in result.source_status.items():
+            if not isinstance(meta, dict):
+                result.source_status[source] = meta = {"data_invalid": True}
+            try:
+                age, frame = int(meta.get("age_ms", -1)), int(meta.get("frame_id", -1))
+                quality = "ok"
+                if not meta.get("read_ok", False):
+                    quality = "unavailable"
+                elif meta.get("data_invalid", False):
+                    quality = "invalid"
+                elif age == -2:
+                    quality = "regressed"
+                elif age >= timeout:
+                    quality = "stale"
+                elif frame >= 0 and result.ego.valid and abs(frame - result.frame_id) > max_gap:
+                    quality = "unsynchronized"
+                elif age < 0 or frame < 0:
+                    quality = "timing_unknown"
+                meta["quality"] = quality
+                meta["usable"] = quality == "ok"
+            except (ValueError, TypeError, OverflowError):
+                meta["quality"], meta["usable"] = "invalid", False
+            if not meta["usable"]:
+                result.sensor_errors.append(source + ":" + meta["quality"])
+                if source == "targets":
+                    result.targets_valid = False
+                elif source.startswith("radar:"):
+                    result.radar_status[source.split(":", 1)[1]] = False
+                elif source.startswith("lane:"):
+                    result.sensor_lane_status[source.split(":", 1)[1]] = False
+                elif source.startswith("ultrasonic"):
+                    result.ultrasonic_valid = False
+                elif source == "imu" and meta["quality"] != "timing_unknown":
+                    # This SDK's IMU struct has no frame header. Keep readable
+                    # measurements, but do not claim synchronized usability.
+                    result.imu_valid = False
+        if not result.targets_valid:
+            result.errors.append("TARGETS_UNAVAILABLE")
+        result.traffic = self._build_traffic(result.ego, result.lane, result.errors)
+        if result.traffic.observed:
+            result.traffic_source = "hdmap+simone"
+        result.valid = result.ego.valid
+        if result.ego.valid and result.ego.age_ms >= 0:
+            result.valid_until = min(result.valid_until, time.monotonic() +
+                                     max(0, timeout - result.ego.age_ms) / 1000.0)
         return result
 
-    def _build_traffic(self, ego):
-        """Populate TrafficControl from the traffic lights the adapter exposes."""
+    def _build_traffic(self, ego, lane, errors):
         traffic = TrafficControl()
-        if not ego.valid:
+        traffic.speed_limit = lane.speed_limit
+        if not ego.valid or not lane.valid:
             return traffic
         try:
-            lights = self.adapter.read_traffic() or []
-        except Exception:
-            self._last_traffic_error = True
+            lights = self.adapter.read_traffic(lane.lane_id) or []
+        except Exception as exc:
+            errors.append("TRAFFIC_UNAVAILABLE:" + type(exc).__name__)
             return traffic
-        signals = [light for light in lights if light.get("status", 0) != 0]
-        if not signals:
+        origin = project_polyline(lane.center_line, ego.x, ego.y)
+        if origin is None:
             return traffic
-        signals.sort(
-            key=lambda light: (
-                math.hypot(float(light.get("x", ego.x)) - ego.x, float(light.get("y", ego.y)) - ego.y)
-            )
-        )
-        nearest = signals[0]
-        traffic.signal_state = _TRAFFIC_LIGHT_STATUS.get(int(nearest.get("status", 0)), "UNKNOWN")
-        distance = math.hypot(
-            float(nearest.get("x", ego.x)) - ego.x, float(nearest.get("y", ego.y)) - ego.y
-        )
-        traffic.signal_distance = distance
-        stop_line = self._stop_line_distance(nearest, distance)
-        traffic.stop_line_distance = stop_line
+        for light in lights:
+            try:
+                status = int(light.get("status", 0))
+                if status not in _TRAFFIC_LIGHT_STATUS or status == 0:
+                    continue
+                sx, sy = float(light["stop_line_x"]), float(light["stop_line_y"])
+                if not all(math.isfinite(v) for v in (sx, sy)):
+                    raise ValueError("invalid stopline")
+                stop = project_polyline(lane.center_line, sx, sy)
+                if (stop is None or stop["distance"] > max(2.0, lane.lane_width)
+                        or stop["raw_ratio"] < 0 or stop["raw_ratio"] > 1):
+                    continue
+                distance = stop["s"] - origin["s"]
+                if distance < 0:
+                    continue
+                item = copy.deepcopy(light)
+                item["opendrive_id"] = int(light.get("opendrive_id", -1))
+                item["count_down"] = int(light.get("count_down", -1))
+                item["stop_distance"] = distance
+                item["signal_state"] = _TRAFFIC_LIGHT_STATUS[status]
+                item["signal_distance"] = -1.0
+                if light.get("x") is not None and light.get("y") is not None:
+                    x, y = float(light["x"]), float(light["y"])
+                    if not all(math.isfinite(v) for v in (x, y)):
+                        raise ValueError("invalid light position")
+                    item["signal_distance"] = math.hypot(x - ego.x, y - ego.y)
+                if not _finite_data(item):
+                    raise ValueError("invalid signal metadata")
+                traffic.candidates.append(item)
+            except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+                errors.append("TRAFFIC_RECORD_INVALID")
+        traffic.candidates.sort(key=lambda item: item["stop_distance"])
+        if not traffic.candidates:
+            return traffic
+        traffic.observed = True
+        nearest = traffic.candidates[0]
+        traffic.stop_line_distance = nearest["stop_distance"]
+        group = [item for item in traffic.candidates
+                 if abs(item["stop_distance"] - nearest["stop_distance"]) < 1.0]
+        # Direction association is not exposed reliably by this binding. Retain
+        # candidates, mark ambiguity, and never choose a green by list order.
+        if len(set(item["opendrive_id"] for item in group)) > 1:
+            traffic.ambiguous, traffic.reason = True, "signal_direction_unresolved"
+            errors.append("TRAFFIC_AMBIGUOUS")
+            return traffic
+        traffic.signal_state = nearest["signal_state"]
+        traffic.signal_id = nearest["opendrive_id"]
+        traffic.count_down = nearest["count_down"]
+        traffic.signal_distance = nearest["signal_distance"]
         traffic.valid = True
+        traffic.reason = "unique_lane_stopline_signal"
         return traffic
 
     @staticmethod
-    def _stop_line_distance(nearest, signal_distance):
-        stop = nearest.get("stop_line_distance", -1.0)
-        if isinstance(stop, (int, float)) and float(stop) >= 0.0:
-            return float(stop)
-        return signal_distance
+    def _path_position(points, x, y):
+        projection = project_polyline(points, x, y)
+        return None if projection is None else projection["s"]
 
     @staticmethod
-    def _build_ego(gps):
+    def _build_ego(gps, timeout_ms=500):
+        try:
+            if (not isinstance(gps, dict) or not _finite_data(gps)
+                    or not all(name in gps for name in ("frame", "x", "y", "heading", "vx", "vy"))):
+                return EgoState()
+            ego = PerceptionBuilder._parse_ego(gps)
+            if ego.age_ms < -1 or ego.age_ms >= timeout_ms:
+                ego.valid = False
+            return ego
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return EgoState()
+
+    @staticmethod
+    def _parse_ego(gps):
         ego = EgoState()
         ego.frame_id = int(gps.get("frame", 0))
         ego.timestamp = int(gps.get("timestamp", 0))
@@ -109,13 +324,39 @@ class PerceptionBuilder(object):
         ego.y = float(gps.get("y", 0.0))
         ego.z = float(gps.get("z", 0.0))
         ego.heading = float(gps.get("heading", 0.0))
-        ego.speed = speed_2d(float(gps.get("vx", 0.0)), float(gps.get("vy", 0.0)))
-        ego.acceleration = speed_2d(float(gps.get("ax", 0.0)), float(gps.get("ay", 0.0)))
+        ego.roll = float(gps.get("roll", 0.0))
+        ego.pitch = float(gps.get("pitch", 0.0))
+        ego.vx = float(gps.get("vx", 0.0))
+        ego.vy = float(gps.get("vy", 0.0))
+        ego.vz = float(gps.get("vz", 0.0))
+        ego.ax = float(gps.get("ax", 0.0))
+        ego.ay = float(gps.get("ay", 0.0))
+        ego.az = float(gps.get("az", 0.0))
+        ego.yaw_rate = float(gps.get("yaw_rate", 0.0))
+        for name in ("roll_rate", "pitch_rate", "engine_rpm"):
+            setattr(ego, name, float(gps.get(name, 0.0)))
+        ego.extra_states = list(gps.get("extra_states", []))
+        ego.sdk_data = dict(gps.get("sdk_data", {}))
+        if not math.isfinite(ego.heading):
+            return EgoState()
+        ego.speed = speed_2d(ego.vx, ego.vy)
+        ego.acceleration = math.cos(ego.heading) * ego.ax + math.sin(ego.heading) * ego.ay
         ego.throttle = float(gps.get("throttle", 0.0))
         ego.brake = float(gps.get("brake", 0.0))
         ego.steering = float(gps.get("steering", 0.0))
         ego.gear = int(gps.get("gear", 0))
-        ego.valid = not bool(gps.get("is_lost", False))
+        ego.wheel_speeds = list(gps.get("wheel_speeds", []))
+        ego.odometer = float(gps.get("odometer", -1.0))
+        ego.age_ms = int(gps.get("age_ms", -1))
+        ego.valid = (ego.frame_id >= 0 and ego.timestamp >= 0 and ego.age_ms >= -1
+                     and not bool(gps.get("is_lost", False))) and all(
+            math.isfinite(value) for value in
+            (ego.x, ego.y, ego.z, ego.heading, ego.roll, ego.pitch,
+             ego.vx, ego.vy, ego.vz,
+             ego.ax, ego.ay, ego.az, ego.speed, ego.acceleration,
+             ego.yaw_rate, ego.throttle, ego.brake, ego.steering,
+             ego.roll_rate, ego.pitch_rate, ego.engine_rpm, ego.odometer)
+        ) and _finite_data(ego.wheel_speeds) and _finite_data(ego.extra_states)
         return ego
 
     @staticmethod
@@ -129,6 +370,22 @@ class PerceptionBuilder(object):
         target.vx = float(item.get("vx", 0.0))
         target.vy = float(item.get("vy", 0.0))
         target.vz = float(item.get("vz", 0.0))
+        target.heading = float(item.get("heading", 0.0))
+        target.roll = float(item.get("roll", 0.0))
+        target.pitch = float(item.get("pitch", 0.0))
+        target.sdk_data = dict(item.get("sdk_data", {}))
+        target.ax = float(item.get("ax", 0.0))
+        target.ay = float(item.get("ay", 0.0))
+        target.az = float(item.get("az", 0.0))
+        target.probability = float(item.get("probability", 1.0))
+        target.sensor_range = float(item.get("sensor_range", -1.0))
+        for name in ("relative_x", "relative_y", "relative_z",
+                     "relative_vx", "relative_vy", "relative_vz",
+                     "relative_roll", "relative_pitch", "relative_heading"):
+            if item.get(name) is not None:
+                setattr(target, name, float(item[name]))
+        if item.get("bbox2d") is not None:
+            target.bbox2d = list(item["bbox2d"])
         target.length = float(item.get("length", 0.0))
         target.width = float(item.get("width", 0.0))
         target.height = float(item.get("height", 0.0))
@@ -142,10 +399,20 @@ class PerceptionBuilder(object):
         target.ttc, target.relative_speed = calculate_ttc(
             target.longitudinal_distance, ego.speed, target.vx, target.vy, ego.heading
         )
-        target.same_lane = (
+        target.lateral_band_match = (
             target.longitudinal_distance > -target.length
             and abs(target.lateral_distance) <= lane_half_width
         )
-        target.valid = target.id >= 0 and float(item.get("probability", 1.0)) >= 0.05
+        target.valid = (target.id >= 0 and 0.05 <= target.probability <= 1.0 and
+                        all(math.isfinite(value) for value in
+                            (target.x, target.y, target.z, target.vx, target.vy, target.vz,
+                             target.heading, target.ax, target.ay, target.az,
+                             target.length, target.width, target.height,
+                             target.probability, target.distance, target.sensor_range))
+                        and _finite_data(item)
+                        and min(target.length, target.width, target.height) >= 0
+                        and _finite_data(target.bbox2d)
+                        and _finite_data([target.relative_x, target.relative_y,
+                                          target.relative_z, target.relative_vx,
+                                          target.relative_vy, target.relative_vz]))
         return target
-

@@ -8,15 +8,35 @@ def clamp(value, low, high):
 
 
 def normalize_angle(angle):
-    while angle > math.pi:
-        angle -= 2.0 * math.pi
-    while angle < -math.pi:
-        angle += 2.0 * math.pi
-    return angle
+    if not math.isfinite(angle):
+        raise ValueError("nonfinite angle")
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def speed_2d(vx, vy):
-    return math.sqrt(vx * vx + vy * vy)
+    return math.hypot(vx, vy)
+
+
+def project_polyline(points, x, y):
+    """Nearest bounded segment projection; no extrapolation past map coverage."""
+    best, along = None, 0.0
+    for index in range(len(points) - 1):
+        ax, ay = points[index][:2]
+        bx, by = points[index + 1][:2]
+        dx, dy = bx - ax, by - ay
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            continue
+        raw_ratio = ((x - ax) * dx + (y - ay) * dy) / (length * length)
+        ratio = clamp(raw_ratio, 0.0, 1.0)
+        px, py = ax + ratio * dx, ay + ratio * dy
+        distance = math.hypot(x - px, y - py)
+        if best is None or distance < best["distance"]:
+            best = {"s": along + ratio * length, "distance": distance,
+                    "index": index, "ratio": ratio, "raw_ratio": raw_ratio,
+                    "point": (px, py), "heading": math.atan2(dy, dx)}
+        along += length
+    return best
 
 
 def world_to_ego(ego_x, ego_y, heading, target_x, target_y):
@@ -61,4 +81,3 @@ def nearest_path_error(points, x, y, heading):
     if best is None:
         return 0.0, 0.0
     return best[1], best[2]
-

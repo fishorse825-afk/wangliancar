@@ -10,8 +10,12 @@
 - 加载 HD Map，输出当前车道号、中心线、左右邻车道、车道宽度和车辆相对车道误差。
 - 自动从案例名称识别场景编号，例如 `06.车道居中控制-测试` 识别为场景 6。
 - 每一帧生成统一的 `Perception`，写入 `runtime_data/latest_perception.json`，方便全队直接查看。
+- 同步写入 `runtime_data/latest_pipeline.json`，记录决策、轨迹、控制和平台发送回执；重复 GPS 帧仍更新快照与各传感器状态，但不会重复发送控制。
+- 额外读取任务路径点、传感器配置、环境，以及 SDK 可用时的 IMU、毫米波雷达、超声波与摄像头车道观测；这些数据在 `Perception` 中各自标明来源/有效性，不与目标真值混用。
+- 地图车道输出左右边界和标线；交通灯仅在当前车道关联到真实停止线时才输出有效灯色与沿车道的停车距离。
 - 已留下决策、规划、控制三个固定入口，并提供离线单元测试。
 - 默认 `send_control=false`，所以目前只观察、不抢车辆控制权。
+- 来源帧采用本机单调时钟判断停滞、回退和跨传感器帧差；超时及模块输出的来源帧、有效期在传输节点验证。传感器没有帧号时标记 `timing_unknown`，不伪称同步。
 
 ## 四个人怎样接入
 
@@ -36,7 +40,7 @@ SimOne API -> 队长 Perception -> 决策 DecisionTarget
 
 1. 在 SimOne 中选择并启动案例。
 2. 双击 `scripts/StartCaptain.bat`。
-3. 日志在 `runtime_data/captain.log`，最新一帧感知数据在 `runtime_data/latest_perception.json`。
+3. 日志在 `runtime_data/captain.log`；感知和整条链的最新快照分别在 `runtime_data/latest_perception.json`、`runtime_data/latest_pipeline.json`。
 4. 停止时按 `Ctrl+C`，或运行 `scripts/KillCaptain.bat`。
 
 只验证 SDK 能否加载，不连接案例：
@@ -54,3 +58,14 @@ E:\Sim-One\Tools\python36\python.exe main.py --once
 ## 开启车辆控制前必须完成
 
 控制成员需要让 `compute_control()` 返回 `valid=True` 的 `ControlOut`，全队联调确认油门、刹车和转向量纲后，再把 `config/default.ini` 中的 `send_control` 改为 `true`。当前占位控制始终无效，即使误开开关也不会发控制指令。
+
+## 感知数据的含义
+
+- `Perception.valid` 表示 GPS 自车基础状态可用；目标、车道、交通、路线及辅助传感器要分别查看各自的 `valid/status`。成功读取但没有目标与接口失败不同。
+- `source_status` 记录每个来源的 `read_ok`、帧号、本机重复帧持续时间、质量与 `usable`。`targets_valid=False` 表示目标读取失败、损坏、过期或不同步；空 `targets` 不能单独解释为“道路无车”。
+- 本机 IMU 独立结构没有帧号；读数正常时 `imu_valid=True`，同时 `source_status["imu"].quality="timing_unknown"`、`usable=False`，需要同步状态的算法不能据此假定它与 GPS 同帧。
+- `Target.same_lane` 只在地图车道归属已核实时有效；`same_lane_valid=False` 时可参考 `lateral_band_match`，但它只是横向距离筛选。车道限速缺少可信来源时保持 `-1`，交通灯方向不明确时保留候选列表并标记 `ambiguous`。
+- `ego.acceleration` 是沿当前车头方向的有符号加速度（m/s²）；`ego.speed` 是水平速度大小（m/s），不表示倒车方向。`ego.age_ms` 和 `targets_age_ms` 是本进程从首次看到该帧起计算的时间，`-1` 表示未知。
+- `route_points` 是二维案例任务路径提示，`route_waypoints` 另保留原始点序号和朝向四元数；两者都不是规划成员输出的 `Trajectory`。`traffic.stop_line_distance` 是沿当前车道中心线到真实停止线的距离，参考点为 GPS 位置；没有可靠停止线时交通字段保持无效。
+- 本机 Python 地图模块未提供可直接调用的车道限速接口，所以 `traffic.speed_limit=-1` 仍表示未知。图像、点云、V2X 原始流需要具体场景需求和独立处理链，不会自动进入当前结构化感知快照。
+- `DecisionTarget`、`Trajectory`、`ControlOut` 通过 `frame_id`、`timestamp`、`valid_until` 关联同一帧；`valid_until` 是本机单调时钟截止时间，不能跨进程持久化复用。当前规划只输出车道中心线前方的参考预览，控制入口仍返回无效，不代表已经具备整车闭环能力。

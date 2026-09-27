@@ -4,6 +4,24 @@ Keep this module independent from SimOne SDK so every member can import and test
 Python 3.6 compatible by design.
 """
 
+import math
+
+
+class FrameOutput(object):
+    """Monotonic deadline is process-local; timestamp retains SDK units."""
+
+    def __init__(self):
+        self.frame_id = -1
+        self.timestamp = 0
+        self.valid_until = 0.0
+        self.errors = []
+
+    def bind(self, source):
+        self.frame_id = source.frame_id
+        self.timestamp = source.timestamp
+        self.valid_until = source.valid_until
+        return self
+
 
 class DecisionMode(object):
     KEEP_LANE = "KEEP_LANE"
@@ -20,14 +38,32 @@ class EgoState(object):
         self.y = 0.0
         self.z = 0.0
         self.heading = 0.0
+        self.roll = 0.0
+        self.pitch = 0.0
         self.speed = 0.0
+        self.vx = 0.0
+        self.vy = 0.0
+        self.vz = 0.0
+        self.yaw_rate = 0.0
+        self.ax = 0.0
+        self.ay = 0.0
+        self.az = 0.0
+        # Signed acceleration along the vehicle's forward axis (m/s^2).
         self.acceleration = 0.0
         self.throttle = 0.0
         self.brake = 0.0
         self.steering = 0.0
+        self.wheel_speeds = []
+        self.odometer = -1.0
         self.gear = 0
         self.valid = False
-        self.age_ms = 0
+        # Local age since this GPS frame was first received, or -1 if unknown.
+        self.age_ms = -1
+        self.roll_rate = 0.0
+        self.pitch_rate = 0.0
+        self.engine_rpm = 0.0
+        self.extra_states = []
+        self.sdk_data = {}
 
 
 class Target(object):
@@ -40,6 +76,20 @@ class Target(object):
         self.vx = 0.0
         self.vy = 0.0
         self.vz = 0.0
+        self.heading = 0.0
+        self.ax = 0.0
+        self.ay = 0.0
+        self.az = 0.0
+        self.probability = 1.0
+        self.source = ""
+        self.sensor_range = -1.0
+        self.relative_x = None
+        self.relative_y = None
+        self.relative_z = None
+        self.relative_vx = None
+        self.relative_vy = None
+        self.relative_vz = None
+        self.bbox2d = None
         self.length = 0.0
         self.width = 0.0
         self.height = 0.0
@@ -48,7 +98,16 @@ class Target(object):
         self.lateral_distance = 0.0
         self.relative_speed = 0.0
         self.same_lane = False
+        self.same_lane_valid = False
+        self.lane_source = "unknown"
+        self.lateral_band_match = False
         self.lane_id = ""
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.relative_roll = None
+        self.relative_pitch = None
+        self.relative_heading = None
+        self.sdk_data = {}
         self.ttc = -1.0
         self.valid = False
 
@@ -57,11 +116,19 @@ class LaneContext(object):
     def __init__(self):
         self.lane_id = ""
         self.center_line = []
+        self.left_boundary = []
+        self.right_boundary = []
         self.left_lane_id = ""
         self.right_lane_id = ""
         self.left_mark_type = "UNKNOWN"
         self.right_mark_type = "UNKNOWN"
         self.lane_width = 3.5
+        self.lane_width_valid = False
+        self.speed_limit = -1.0
+        self.speed_limit_source = "unavailable"
+        self.predecessor_lane_ids = []
+        self.successor_lane_ids = []
+        self.source = "none"
         self.heading_error = 0.0
         self.lateral_offset = 0.0
         self.valid = False
@@ -70,6 +137,12 @@ class LaneContext(object):
 class TrafficControl(object):
     def __init__(self):
         self.signal_state = "UNKNOWN"
+        self.signal_id = -1
+        self.count_down = -1
+        self.candidates = []
+        self.ambiguous = False
+        self.reason = "unavailable"
+        self.observed = False
         self.signal_distance = -1.0
         self.stop_line_distance = -1.0
         self.speed_limit = -1.0
@@ -80,22 +153,52 @@ class Perception(object):
     """Captain -> decision member."""
 
     def __init__(self):
+        self.valid_until = 0.0
         self.ego = EgoState()
         self.targets = []
         self.lane = LaneContext()
         self.traffic = TrafficControl()
+        self.traffic_signs = []
+        self.traffic_signs_valid = False
+        # Scenario waypoints are route hints, not a planned trajectory.
+        self.route_points = []
+        self.route_waypoints = []
+        self.route_valid = False
+        self.sensor_configurations = []
+        self.sensor_configurations_valid = False
+        self.environment = {}
+        self.environment_valid = False
+        self.imu = {}
+        self.imu_valid = False
+        self.radar_detections = []
+        self.radar_status = {}
+        self.ultrasonic_detections = []
+        self.ultrasonic_valid = False
+        self.sensor_lane_observations = []
+        self.sensor_lane_status = {}
+        self.sensor_errors = []
+        self.source_status = {}
+        self.target_source = "none"
+        self.targets_valid = False
+        self.targets_frame_id = -1
+        self.targets_timestamp = 0
+        self.targets_age_ms = -1
+        self.traffic_source = "none"
         self.scene_id = 0
         self.case_name = ""
+        self.case_id = ""
+        self.task_id = ""
         self.frame_id = 0
         self.timestamp = 0
         self.valid = False
         self.errors = []
 
 
-class DecisionTarget(object):
+class DecisionTarget(FrameOutput):
     """Decision member -> planning member."""
 
     def __init__(self):
+        super(DecisionTarget, self).__init__()
         self.mode = DecisionMode.KEEP_LANE
         self.target_speed = 0.0
         self.target_lane_id = ""
@@ -113,20 +216,26 @@ class TrajectoryPoint(object):
         self.relative_time = float(relative_time)
 
 
-class Trajectory(object):
+class Trajectory(FrameOutput):
     """Planning member -> control member."""
 
     def __init__(self):
+        super(Trajectory, self).__init__()
         self.points = []
         self.target_speed = 0.0
         self.emergency_stop = False
+        self.stop_required = False
+        self.stop_distance = -1.0
+        self.target_lane_id = ""
+        self.reason = ""
         self.valid = False
 
 
-class ControlOut(object):
+class ControlOut(FrameOutput):
     """Control member -> captain/runtime -> SimOne API."""
 
     def __init__(self):
+        super(ControlOut, self).__init__()
         self.throttle = 0.0
         self.brake = 0.0
         self.steering = 0.0
@@ -139,8 +248,22 @@ class ControlOut(object):
         self.source = ""
 
     def clamp(self):
-        self.throttle = max(0.0, min(1.0, float(self.throttle)))
-        self.brake = max(0.0, min(1.0, float(self.brake)))
-        self.steering = max(-1.0, min(1.0, float(self.steering)))
+        values = (self.throttle, self.brake, self.steering)
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                   and math.isfinite(v) for v in values):
+            self.valid = False
+            raise ValueError("nonfinite or nonnumeric actuator command")
+        if type(self.gear) is not int or self.gear not in (0, 1, 2, 3):
+            self.valid = False
+            raise ValueError("automatic gear must be N/D/R/P (0..3)")
+        if not all(type(getattr(self, name)) is bool for name in
+                   ("handbrake", "left_signal", "right_signal", "hazard_signal")):
+            self.valid = False
+            raise ValueError("signal and handbrake fields must be bool")
+        self.throttle = max(0.0, min(1.0, self.throttle))
+        self.brake = max(0.0, min(1.0, self.brake))
+        self.steering = max(-1.0, min(1.0, self.steering))
+        # Brake/handbrake takes precedence over propulsion.
+        if self.brake > 0.0 or self.handbrake or self.gear in (0, 3):
+            self.throttle = 0.0
         return self
-
