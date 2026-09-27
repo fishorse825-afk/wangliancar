@@ -1,0 +1,61 @@
+"""Acceptance checks distinguish clean data from missing or substituted sources."""
+
+import copy
+import unittest
+
+from scripts.accept_scene import analyze_frames
+
+
+def frame(number):
+    return {
+        "frame_id": number, "scene_id": 6, "case_id": "test-06",
+        "case_name": "06.车道居中控制", "valid": True,
+        "ego": {"valid": True, "frame_id": number, "x": float(number),
+                "y": 0.0, "heading": 0.0, "speed": 1.0, "vx": 1.0,
+                "vy": 0.0, "acceleration": 0.0},
+        "source_status": {"gps": {"usable": True},
+                          "targets": {"usable": True}},
+        "targets_valid": True, "targets": [],
+        "target_source": "sensor:perfectPerception1",
+        "sensor_configurations_valid": True,
+        "sensor_configurations": [{"id": "perfectPerception1"}],
+        "lane": {"valid": True, "lane_id": "1_0_-1",
+                 "center_line": [[0, 0, 0], [100, 0, 0]],
+                 "left_boundary": [[0, 2, 0], [100, 2, 0]],
+                 "right_boundary": [[0, -2, 0], [100, -2, 0]],
+                 "lane_width": 4.0, "lane_width_valid": True,
+                 "lateral_offset": 0.0, "heading_error": 0.0},
+    }
+
+
+class SceneAcceptanceTests(unittest.TestCase):
+    def test_no_live_frames_is_pending_data_not_acceptance(self):
+        report = analyze_frames([], 6, 2)
+        self.assertEqual("NO_DATA", report["status"])
+
+    def test_valid_empty_sensor_target_frames_pass_structure_only(self):
+        report = analyze_frames([frame(1), frame(2)], 6, 2)
+        self.assertEqual("STRUCTURAL_PASS", report["status"])
+        self.assertEqual("PENDING", report["event_review"])
+        self.assertEqual(0, report["counts"]["target_frames_with_objects"])
+
+    def test_ground_truth_is_not_sensor_acceptance(self):
+        values = [frame(1), frame(2)]
+        for value in values:
+            value["target_source"] = "ground_truth"
+        report = analyze_frames(values, 6, 2)
+        self.assertEqual("FAIL_OR_INCOMPLETE", report["status"])
+        self.assertEqual(0, report["counts"]["targets_ok"])
+        self.assertTrue(any("ground-truth" in warning for warning in report["warnings"]))
+
+    def test_wrong_scene_and_stalled_frame_fail(self):
+        first = frame(1)
+        second = copy.deepcopy(first)
+        second["scene_id"] = 5
+        report = analyze_frames([first, second], 6, 2)
+        self.assertEqual("FAIL_OR_INCOMPLETE", report["status"])
+        self.assertTrue(any("strictly increasing" in failure for failure in report["failures"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

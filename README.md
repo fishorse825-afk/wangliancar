@@ -68,4 +68,5 @@ E:\Sim-One\Tools\python36\python.exe main.py --once
 - `ego.acceleration` 是沿当前车头方向的有符号加速度（m/s²）；`ego.speed` 是水平速度大小（m/s），不表示倒车方向。`ego.age_ms` 和 `targets_age_ms` 是本进程从首次看到该帧起计算的时间，`-1` 表示未知。
 - `route_points` 是二维案例任务路径提示，`route_waypoints` 另保留原始点序号和朝向四元数；两者都不是规划成员输出的 `Trajectory`。`traffic.stop_line_distance` 是沿当前车道中心线到真实停止线的距离，参考点为 GPS 位置；没有可靠停止线时交通字段保持无效。
 - 本机 Python 地图模块未提供可直接调用的车道限速接口，所以 `traffic.speed_limit=-1` 仍表示未知。图像、点云、V2X 原始流需要具体场景需求和独立处理链，不会自动进入当前结构化感知快照。
+- 41 场景的数据需求、必需 API 与现场验收步骤见 [场景数据验收清单](perception/SCENE_DATA_ACCEPTANCE.md)；只读采样命令为 `python scripts/accept_scene.py --scene 6 --frames 20 --timeout-sec 30`。报告的 `STRUCTURAL_PASS` 仅表示帧结构通过，事件仍需现场核对。
 - `DecisionTarget`、`Trajectory`、`ControlOut` 通过 `frame_id`、`timestamp`、`valid_until` 关联同一帧；`valid_until` 是本机单调时钟截止时间，不能跨进程持久化复用。当前规划只输出车道中心线前方的参考预览，控制入口仍返回无效，不代表已经具备整车闭环能力。
