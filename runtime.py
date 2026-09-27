@@ -5,7 +5,9 @@ import os
 import signal
 import time
 
-from core.serialization import perception_to_dict
+from core.serialization import perception_to_dict, to_dict
+from core.validation import validate_output
+from core.interfaces import DecisionTarget, Trajectory, ControlOut
 from members.control_stub import compute_control
 from members.decision_stub import decide
 from members.planning_stub import plan
@@ -22,6 +24,7 @@ class CaptainRuntime(object):
         self.stop_requested = False
         self.pid_path = os.path.join(config.runtime_dir, "captain.pid")
         self.snapshot_path = os.path.join(config.runtime_dir, "latest_perception.json")
+        self.pipeline_path = os.path.join(config.runtime_dir, "latest_pipeline.json")
         self._warned_no_control = False
 
     def request_stop(self, unused_signal=None, unused_frame=None):
@@ -62,22 +65,46 @@ class CaptainRuntime(object):
                 time.sleep(0.2)
                 continue
             perception = builder.build()
-            if last_frame == perception.frame_id and not once:
-                self._sleep_remaining(start, period)
-                continue
+            repeated = last_frame == perception.frame_id
             last_frame = perception.frame_id
-            decision = decide(perception)
-            trajectory = plan(perception, decision)
-            control = compute_control(perception, trajectory)
-            if self.config.send_control:
+            try:
+                decision = validate_output(decide(perception), DecisionTarget, perception)
+            except Exception as exc:
+                decision = DecisionTarget().bind(perception)
+                decision.errors.append("DECISION_INVALID:" + type(exc).__name__ + ":" + str(exc))
+            try:
+                trajectory = validate_output(plan(perception, decision), Trajectory, decision)
+            except Exception as exc:
+                trajectory = Trajectory().bind(decision)
+                trajectory.errors.append("TRAJECTORY_INVALID:" + type(exc).__name__ + ":" + str(exc))
+            try:
+                control = compute_control(perception, trajectory)
                 if control.valid:
-                    if not self.adapter.send_control(control):
-                        self.logger.warning("控制指令发送失败 frame=%s", perception.frame_id)
+                    control = validate_output(control, ControlOut, trajectory)
+            except Exception as exc:
+                control = ControlOut().bind(trajectory)
+                control.errors.append("CONTROL_INVALID:" + type(exc).__name__ + ":" + str(exc))
+            receipt = {"attempted": False, "ok": False, "reason": "observe_mode"}
+            if self.config.send_control:
+                if repeated:
+                    receipt["reason"] = "gps_frame_repeated"
+                elif decision.valid and trajectory.valid and control.valid:
+                    receipt["attempted"] = True
+                    receipt["ok"] = bool(self.adapter.send_control(control))
+                    receipt["reason"] = "sent" if receipt["ok"] else "send_failed"
+                    receipt["adapter"] = to_dict(getattr(self.adapter, "last_send_result", {}))
+                    if not receipt["ok"]:
+                        self.logger.warning("控制指令发送失败 frame=%s receipt=%s",
+                                            perception.frame_id, receipt["adapter"])
                 elif not self._warned_no_control:
-                    self.logger.warning("控制模块仍为占位实现，因此不会向车辆发送控制")
+                    receipt["reason"] = "pipeline_invalid"
+                    self.logger.warning("数据链或控制输出无效，不发送控制 frame=%s", perception.frame_id)
                     self._warned_no_control = True
+                else:
+                    receipt["reason"] = "pipeline_invalid"
             if self.config.publish_json:
                 self._publish(perception)
+                self._publish_pipeline(perception, decision, trajectory, control, receipt)
             processed += 1
             if processed == 1 or processed % 100 == 0:
                 self.logger.info(
@@ -112,8 +139,18 @@ class CaptainRuntime(object):
                 ensure_ascii=False,
                 indent=2,
                 sort_keys=True,
+                allow_nan=False,
             )
         os.replace(temporary, self.snapshot_path)
+
+    def _publish_pipeline(self, perception, decision, trajectory, control, receipt):
+        temporary = self.pipeline_path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump({"perception_frame_id": perception.frame_id,
+                       "decision": to_dict(decision), "trajectory": to_dict(trajectory),
+                       "control": to_dict(control), "send": receipt},
+                      stream, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
+        os.replace(temporary, self.pipeline_path)
 
     @staticmethod
     def _sleep_remaining(start, period):
@@ -138,4 +175,3 @@ class CaptainRuntime(object):
                 os.remove(self.pid_path)
             except OSError:
                 pass
-
