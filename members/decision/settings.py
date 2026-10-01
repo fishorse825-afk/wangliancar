@@ -2,13 +2,55 @@
 
 Every value here is a provisional experiment setting, not a measured vehicle
 capability or a competition threshold. See BASELINE.md.
+
+Field tuning can override any parameter without a code change by setting an
+environment variable. This keeps the shared `config/default.ini`, which the
+captain owns, untouched:
+
+    NEVC_DECISION_CRUISE_SPEED=11.1
+    NEVC_DECISION_TIME_HEADWAY=1.5
 """
 
 import math
+import os
+
+
+# Environment variable prefix for provisional tuning overrides.
+ENV_PREFIX = "NEVC_DECISION_"
+
+FIELDS = ("cruise_speed", "min_gap", "time_headway", "resume_margin",
+          "emergency_clearance", "emergency_ttc", "launch_ttc_cap",
+          "stop_margin", "obstacle_stop_margin", "traffic_stop_margin",
+          "blind_speed_tolerance")
 
 
 def _number(value):
     return type(value) in (int, float) and math.isfinite(value)
+
+
+def _parse(name, raw):
+    """Parse one override, rejecting rather than silently ignoring bad input."""
+    text = str(raw).strip()
+    if not text:
+        raise ValueError("decision override {0} is empty".format(name))
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError("decision override {0}={1!r} is not a number".format(name, raw))
+    if not math.isfinite(value):
+        raise ValueError("decision override {0}={1!r} is not finite".format(name, raw))
+    return value
+
+
+def overrides_from_environment(environ=None):
+    """Return the parameter overrides present in the environment."""
+    environ = os.environ if environ is None else environ
+    values = {}
+    for name in FIELDS:
+        key = ENV_PREFIX + name.upper()
+        if key in environ:
+            values[name] = _parse(key, environ[key])
+    return values
 
 
 class DecisionSettings(object):
@@ -44,10 +86,7 @@ class DecisionSettings(object):
         self.blind_speed_tolerance = blind_speed_tolerance
 
     def validate(self):
-        for name in ("cruise_speed", "min_gap", "time_headway", "resume_margin",
-                     "emergency_clearance", "emergency_ttc", "launch_ttc_cap",
-                     "stop_margin", "obstacle_stop_margin", "traffic_stop_margin",
-                     "blind_speed_tolerance"):
+        for name in FIELDS:
             value = getattr(self, name)
             if not _number(value) or value < 0.0:
                 raise ValueError("decision setting {0} must be finite and nonnegative".format(name))
@@ -58,3 +97,19 @@ class DecisionSettings(object):
         if self.resume_margin <= 0.0:
             raise ValueError("resume_margin must be positive")
         return self
+
+    def replace(self, **overrides):
+        """Return a validated copy with the named parameters replaced."""
+        values = dict((name, getattr(self, name)) for name in FIELDS)
+        for name, value in overrides.items():
+            if name not in values:
+                raise ValueError("unknown decision setting: " + str(name))
+            values[name] = value
+        return DecisionSettings(**values).validate()
+
+    @classmethod
+    def from_environment(cls, environ=None, **overrides):
+        """Build settings from the environment, then apply explicit overrides."""
+        values = overrides_from_environment(environ)
+        values.update(overrides)
+        return cls().replace(**values)

@@ -48,7 +48,9 @@ class DecisionEngine(object):
     """
 
     def __init__(self, settings=None):
-        self.settings = settings if settings is not None else DecisionSettings()
+        # Environment overrides are read here so field tuning needs no code
+        # change and no edit to the captain's shared config file.
+        self.settings = settings if settings is not None else DecisionSettings.from_environment()
         self.settings.validate()
         self._blind_fault_count = 0
         self._blind_stop = False

@@ -76,6 +76,24 @@ V1 仍**不实现**变道、倒车、路口通行和绕障。
 
 `cruise_speed` 在**没有可信限速来源**时是唯一的速度来源，它直接决定赛题能不能跑完。联调前必须和赛题要求对齐。
 
+### 现场改参数不需要改代码
+
+所有参数都可以用环境变量覆盖，因此**不需要动队长维护的 `config/default.ini`**：
+
+```powershell
+# 单个参数
+$env:NEVC_DECISION_CRUISE_SPEED = "11.1"
+
+# 多个参数
+$env:NEVC_DECISION_TIME_HEADWAY = "1.5"
+$env:NEVC_DECISION_MIN_GAP = "5"
+python main.py
+```
+
+变量名规则为 `NEVC_DECISION_` + 参数名大写。非法值（非数字、非有限、负值、`cruise_speed=0`）会**直接报错退出，不会静默忽略**——静默忽略会让现场以为改了参数其实没改。
+
+优先级：代码显式传入 > 环境变量 > 内置默认值。
+
 ## 与规划、控制的接口语义
 
 - `stop_distance` 按公共协议解释为**沿车道中心线从当前 GPS 投影到停车点的距离**；`-1` 表示未知。V1 的余量在决策侧扣除，规划侧对 `STOP` 模式**不再重复扣减**。这个责任划分是**暂定**的，需与规划组确认。
@@ -85,14 +103,28 @@ V1 仍**不实现**变道、倒车、路口通行和绕障。
 
 ## 验证与范围
 
-离线测试在 `tests/test_decision.py`，37 个用例，覆盖无效/过期/非有限感知、起步与限速、交通灯（含灯组方向未解决）、紧急包络边界、跟车速度上界、车道归属未核实、盲停锁存与解除、输入不变性、输出帧继承与可序列化、规划互操作。
+离线测试在 `tests/test_decision.py`（42 个用例）与 `tests/test_replay_decision.py`（9 个用例，覆盖快照回放工具）。`test_decision.py` 覆盖无效/过期/非有限感知、起步与限速、交通灯（含灯组方向未解决）、紧急包络边界、跟车速度上界、车道归属未核实、盲停锁存与解除、参数环境变量覆盖与校验、输入不变性、输出帧继承与可序列化、规划互操作。
 
 ```powershell
 python -B -m unittest tests.test_decision -v
 python -B -m unittest discover -s tests -v
 ```
 
-**验证范围限制**：本轮只在 Python 3.13 上运行过 `python3 -m unittest discover -s tests`（94 个用例通过），**没有**在 SimOne 自带的 Python 3.6 上执行。代码刻意避开 3.6 不支持的写法（无 f-string、无 `dataclass`、无海象运算符），但这不等于已在目标环境验证。**离线通过不代表场景通过或成绩**。
+### 用真实快照离线回放
+
+`scripts/replay_decision.py` 可以把 `latest_perception.json` 或一组历史快照喂给决策引擎，统计行为分布和原因。**只读**，不连接 SimOne：
+
+```powershell
+python scripts/replay_decision.py --snapshot runtime_data/latest_perception.json
+python scripts/replay_decision.py --directory runtime_data\scene_acceptance --summary-only
+python scripts/replay_decision.py --directory runtime_data\scene_acceptance --revive-ttl 5 --json-out report.json
+```
+
+它回答的是合成单测答不了的问题：真实数据里**有多少比例的目标真正通过了地图车道核实**、目标尺寸是否发布、行为树是否塌缩成单一行为。
+
+⚠️ `valid_until` 是进程内的单调时钟截止时间，所以保存下来的快照**必然是过期的**，默认运行时引擎会在新鲜度门控处停下，每帧都输出同一种行为。这是**安全规则在生效，不是决策故障**。要观察完整行为树需要加 `--revive-ttl`，它会把每帧有效期重置为"当前时刻 + N 秒"——这会**破坏新鲜度语义**，脚本会打印显著警告，其输出只能用于看行为选择，**不能作为实时数据结论**。
+
+**验证范围限制**：本轮只在 Python 3.13 上运行过 `python3 -m unittest discover -s tests`（108 个用例通过），**没有**在 SimOne 自带的 Python 3.6 上执行。代码刻意避开 3.6 不支持的写法（无 f-string、无 `dataclass`、无海象运算符），但这不等于已在目标环境验证。**离线通过不代表场景通过或成绩**；回放快照也不代表闭环验证。
 
 ## 待协作确认
 

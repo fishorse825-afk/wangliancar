@@ -7,6 +7,7 @@ Passing these tests is not evidence of scenario performance.
 
 import copy
 import json
+import os
 import time
 import unittest
 
@@ -425,6 +426,47 @@ class DecisionTests(unittest.TestCase):
                     DecisionSettings(resume_margin=0.0)):
             with self.assertRaises(ValueError):
                 bad.validate()
+
+    def test_settings_follow_environment_overrides(self):
+        environ = {"NEVC_DECISION_CRUISE_SPEED": "11.1",
+                   "NEVC_DECISION_TIME_HEADWAY": "1.5"}
+        settings = DecisionSettings.from_environment(environ=environ)
+        self.assertEqual(11.1, settings.cruise_speed)
+        self.assertEqual(1.5, settings.time_headway)
+        # Untouched parameters keep their built-in values.
+        self.assertEqual(4.0, settings.min_gap)
+
+    def test_explicit_override_beats_the_environment(self):
+        settings = DecisionSettings.from_environment(
+            environ={"NEVC_DECISION_CRUISE_SPEED": "11.1"}, cruise_speed=9.0)
+        self.assertEqual(9.0, settings.cruise_speed)
+
+    def test_environment_overrides_are_validated_not_ignored(self):
+        for environ in ({"NEVC_DECISION_CRUISE_SPEED": "abc"},
+                        {"NEVC_DECISION_CRUISE_SPEED": ""},
+                        {"NEVC_DECISION_MIN_GAP": "nan"},
+                        {"NEVC_DECISION_CRUISE_SPEED": "0"},
+                        {"NEVC_DECISION_MIN_GAP": "-2"}):
+            with self.assertRaises(ValueError):
+                DecisionSettings.from_environment(environ=environ)
+
+    def test_unknown_parameter_name_is_rejected(self):
+        with self.assertRaises(ValueError):
+            DecisionSettings().replace(no_such_parameter=1.0)
+
+    def test_engine_uses_environment_settings_by_default(self):
+        saved = os.environ.get("NEVC_DECISION_CRUISE_SPEED")
+        os.environ["NEVC_DECISION_CRUISE_SPEED"] = "3.5"
+        try:
+            engine = DecisionEngine()
+            self.assertEqual(3.5, engine.settings.cruise_speed)
+            p = perception(speed=0.0)
+            self.assertEqual(3.5, engine.run(p).target_speed)
+        finally:
+            if saved is None:
+                del os.environ["NEVC_DECISION_CRUISE_SPEED"]
+            else:
+                os.environ["NEVC_DECISION_CRUISE_SPEED"] = saved
 
     def test_engine_never_raises_on_malformed_perception(self):
         engine = DecisionEngine()
